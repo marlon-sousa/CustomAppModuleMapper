@@ -1,13 +1,17 @@
 # -*- coding: UTF-8 -*-
-# A part of the EnhancedDictionaries addon for NVDA
-# Copyright (C) 2020 Marlon Sousa
-# This file is covered by the GNU General Public License.
+# A part of the CustomAppModulesMapper addon for NVDA
+# Copyright (C) 2024 Marlon Sousa
+# This file is covered by the MIT License.
 # See the file COPYING.txt for more details.
 
+from dataclasses import dataclass
+from enum import Enum
+from functools import reduce
+from . import mapperHandler
+from .mapperHandler import Mapping
 import addonHandler
-import appModules
-import appModuleHandler
 from gui import guiHelper
+from logHandler import log
 import wx
 import gui
 import gui.settingsDialogs
@@ -15,14 +19,31 @@ import gui.settingsDialogs
 addonHandler.initTranslation()
 
 
+class CustomMappingAction(Enum):
+    ADD = 1
+    IGNORE = 2
+    MODIFY = 3
+    REMOVE = 4
+
+
+@dataclass
+class CustomMappingItem(mapperHandler.Mapping):
+    action: CustomMappingAction
+
+
 class CustomAppModuleMapperSettingPanel(gui.settingsDialogs.SettingsPanel):
     # Translators: This is the label for the Custom Application Module Mapper settings category in NVDA Settings screen. # noqa E501
     title = _("Custom Application Module Mapper")
 
     def makeSettings(self, settingsSizer):
+        self.mappings = {}
         sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
         # Translators: label used to toggle the auto check update.
-        self.mappingsList = sHelper.addLabeledControl(_("Mappings"), wx.ListCtrl, style=wx.LC_REPORT)
+        self.mappingsList = sHelper.addLabeledControl(
+            _("Mappings"),
+            wx.ListCtrl,
+            style=wx.LC_REPORT | wx.LC_SINGLE_SEL
+        )
         self.mappingsList.InsertColumn(0, _("App Name"))
         self.mappingsList.InsertColumn(1, _("Module Name"))
         actionsHelper = guiHelper.BoxSizerHelper(self, orientation=wx.HORIZONTAL)
@@ -33,33 +54,90 @@ class CustomAppModuleMapperSettingPanel(gui.settingsDialogs.SettingsPanel):
         sHelper.addItem(actionsHelper)
         settingsSizer.Fit(self)
         self.bindEvents()
+        self.buildMappingsList()
 
     def bindEvents(self):
         self.addButton.Bind(wx.EVT_BUTTON, self.onAdd)
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
 
-    def _getAllAvailableAppModules(self):
-        modules = list(appModuleHandler._executableNamesToAppModsAddons.values()) + \
-            list(appModules.EXECUTABLE_NAMES_TO_APP_MODS.values())
-        return sorted(set(modules))
+    def buildMappingsList(self):
+        customModulesMapping = mapperHandler.getCustomModulesMapping()
+        self.mappings = reduce(
+            lambda acc, item: acc.update({
+                item.app: CustomMappingItem(
+                    item.app,
+                    item.appModule,
+                    item.appOriginalModule,
+                    CustomMappingAction.IGNORE
+                )
+            }) or acc,
+            customModulesMapping,
+            {}
+        )
+        self.refreshList()
+
+    def refreshList(self):
+        self.mappingsList.DeleteAllItems()
+        mappingModel = dict(
+            filter(
+                lambda item: item[1].action != CustomMappingAction.REMOVE,
+                self.mappings.items()
+            )
+        )
+        sorted_keys = sorted(mappingModel.keys())
+        for key in sorted_keys:
+            mapping = self.mappings[key]
+            self.mappingsList.Append((mapping.app, mapping.appModule))
+
+    def onAddDialogResumed(self, item: CustomMappingItem):
+        self.mappings[item.app] = item
+        self.refreshList()
 
     def onAdd(self, evt):
         title = _("add mapping")
         gui.mainFrame.prePopup()
-        dialog = ModuleMappingDialog(self, title, self._getAllAvailableAppModules())
+        availableModules = mapperHandler.getAllAvailableAppModules()
+        dialog = ModuleMappingDialog(self, title, availableModules)
         if dialog.ShowModal() == wx.ID_OK:
-            self.mappingsList.Append((dialog.app, dialog.appModule))
-            appModuleHandler.registerExecutableWithAppModule(dialog.app, dialog.appModule)
-            appModuleHandler.terminate()
-            appModuleHandler.initialize()
+            self.onAddDialogResumed(dialog.result)
         dialog.Destroy()
         gui.mainFrame.postPopup()
 
     def onRemove(self, evt):
-        pass
+        selected = self.mappingsList.GetFirstSelected()
+        if selected == -1:
+            return
+        app = self.mappingsList.GetItemText(selected)
+        self.mappings[app].action = CustomMappingAction.REMOVE
+        self.refreshList()
 
     def onSave(self):
-        pass
+        mustRestart = False
+        newMappings = []
+        for item in self.mappings.values():
+            if item.action == CustomMappingAction.ADD:
+                mapperHandler.associateAppModule(item.app, item.appModule)
+                newMappings.append(Mapping(item.app, item.appModule, item.appOriginalModule))
+                mustRestart = True
+                log.info(f"Associating new mapping: {item.app} app with {item.appModule} module")
+            elif item.action == CustomMappingAction.REMOVE:
+                mapperHandler.disassociateAppModule(item.app)
+                mustRestart = True
+                log.info(f"Disassociating mapping: {item.app} app with {item.appModule} module")
+                if item.appOriginalModule is not None:
+                    mapperHandler.associateAppModule(item.app, item.appOriginalModule)
+                    log.info(f"Restoring original mapping: {item.app} app with {item.appOriginalModule} module") # noqa E501
+            elif item.action == CustomMappingAction.MODIFY:
+                mapperHandler.associateAppModule(item.app, item.appModule)
+                log.info(f"Modifying mapping: {item.app} app with {item.appModule} module")
+                newMappings.append(Mapping(item.app, item.appModule, item.appOriginalModule))
+                mustRestart = True
+            else:
+                newMappings.append(Mapping(item.app, item.appModule, item.appOriginalModule))
+        if mustRestart:
+            mapperHandler.restart()
+        mapperHandler.customModulesMapping = newMappings
+        mapperHandler.persist()
 
 
 class ModuleMappingDialog(
@@ -67,12 +145,11 @@ class ModuleMappingDialog(
     wx.Dialog,  # wxPython does not seem to call base class initializer, put last in MRO
 ):
 
-    # Translators: This is the label for the edit dictionary entry dialog.
-    def __init__(self, parent, title, availableModules):
+    def __init__(self, parent, title, customModulesMapping):
         super(ModuleMappingDialog, self).__init__(parent, title=title)
-        self.app = None
-        self.appModule = None
-        self.availableModules = availableModules
+        self.result = None
+        self.customModulesMapping = customModulesMapping
+        self.availableModules = mapperHandler.getAllAvailableAppModules()
         mainSizer = wx.BoxSizer(wx.VERTICAL)
         sHelper = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
 
@@ -96,6 +173,16 @@ class ModuleMappingDialog(
         self.Bind(wx.EVT_BUTTON, self.onOk, id=wx.ID_OK)
 
     def onOk(self, evt):
-        self.app = self.AppTextCtrl.GetValue()
-        self.appModule = self.appModulesComboBox.GetValue()
+        app = self.AppTextCtrl.GetValue()
+        appModule = self.appModulesComboBox.GetValue()
+        if not app or not appModule:
+            wx.MessageBox(_("Please fill all fields"), _("Error"), wx.OK | wx.ICON_ERROR)
+            return
+        originalMapping = mapperHandler.getAllConfiguredMappings()
+        action = CustomMappingAction.ADD if app not in self.customModulesMapping else CustomMappingAction.MODIFY # noqa E501
+        if app in self.customModulesMapping:
+            originalModule = self.customModulesMapping[app].appModule
+        else:
+            originalModule = originalMapping.get(app, None)
+        self.result = CustomMappingItem(app, appModule, originalModule, action)
         evt.Skip()
